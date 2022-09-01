@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from torch_geometric.utils import degree
 
 from recbole.model.init import xavier_uniform_initialization
-from recbole.model.loss import EmbLoss
+from recbole.model.loss import EmbLoss, BPRLoss
 from recbole.utils import InputType
 
 from recbole_gnn.model.abstract_recommender import GeneralGraphRecommender
@@ -29,7 +29,7 @@ class SGLL(GeneralGraphRecommender):
     r"""SGL是一个基于GCN的推荐模型。
         SGL在经典的推荐监督任务的基础上增加了一个辅助的自我监督任务，通过自我判别来强化节点表示学习。
         SGL可以生成一个节点的多个视图，使同一节点的不同视图与其他节点的视图之间的一致性最大化。
-        SGL设计了三种操作符来生成视图——节点丢失、边丢失和随机游走——以不同的方式改变图结构。
+        SGL设计了三种操作符来生成视图 — — 节点丢失、边丢失和随机游走 — — 以不同的方式改变图结构。
         我们按照原作者的方法，采用两两训练模式来实现该模型。
 
         SGL supplements the classical supervised task of recommendation with an auxiliary self supervised task, which
@@ -54,11 +54,12 @@ class SGLL(GeneralGraphRecommender):
         self.reg_weight = config["reg_weight"]  # L2正则化权值
         self.ssl_weight = config["ssl_weight"]  # 控制SSL强度的超参数
 
+        self.mf_loss = BPRLoss()  # BPR损失
+
         self._user = dataset.inter_feat[dataset.uid_field]  # user列
         self._item = dataset.inter_feat[dataset.iid_field]  # item列
 
         # 定义层和损失（layer 和 LightGCN是一样的）
-        # self.entity_embedding = torch.nn.Embedding(self.n_users + self.n_items, self.latent_dim)  # 实体嵌入层
         self.user_embedding = torch.nn.Embedding(self.n_users, self.latent_dim)  # 用户嵌入层
         self.item_embedding = torch.nn.Embedding(self.n_items, self.latent_dim)  # 项目嵌入层
         self.gcn_conv = LightGCNConv(dim=self.latent_dim)
@@ -78,6 +79,8 @@ class SGLL(GeneralGraphRecommender):
 
         # 进行多层gcn的计算
         for layer_idx in range(self.n_layers):
+            # all_embeddings = self.gcn_conv(all_embeddings, self.edge_index, self.edge_weight)
+            # embeddings_list.append(all_embeddings)
             if layer_idx > 0:
                 temp_embeddings = torch.cat(
                     [all_embeddings.unsqueeze(dim=1), embeddings_list[layer_idx - 1].unsqueeze(dim=1)],
@@ -87,7 +90,6 @@ class SGLL(GeneralGraphRecommender):
                 all_embeddings = self.gcn_conv(temp_embeddings, self.edge_index, self.edge_weight)
             else:
                 all_embeddings = self.gcn_conv(all_embeddings, self.edge_index, self.edge_weight)
-
             embeddings_list.append(all_embeddings)
 
         # 算出最终的嵌入
@@ -116,7 +118,8 @@ class SGLL(GeneralGraphRecommender):
         p_scores = torch.mul(u_e, pi_e).sum(dim=1)
         n_scores = torch.mul(u_e, ni_e).sum(dim=1)
         # BPR损失
-        l1 = torch.sum(-F.logsigmoid(p_scores - n_scores))
+        l1 = self.mf_loss(p_scores, n_scores)
+
         # 计算l2正则化损失
         u_e_p = self.user_embedding(user_list)
         pi_e_p = self.item_embedding(pos_item_list)
@@ -138,34 +141,40 @@ class SGLL(GeneralGraphRecommender):
         """
         ssl_losses = []
 
-        center_embed = embed_list[0]
-        center_user_embed, center_item_embed = torch.split(center_embed, [self.n_users, self.n_items], dim=0)
+        for layer in range(self.n_layers - 2, self.n_layers + 1):
+            center_embed = embed_list[layer - 2]
+            center_user_embed, center_item_embed = torch.split(center_embed, [self.n_users, self.n_items], dim=0)
 
-        for layer in range(1, len(embed_list)):
+            # 先拿后面每一层和第一层做对比损失
+            # for layer in range(1, len(embed_list)):
             context_embed = embed_list[layer]
             context_user_embed, context_item_embed = torch.split(context_embed, [self.n_users, self.n_items], dim=0)
 
-            u_emd1 = F.normalize(center_user_embed[user_list], dim=1)  # L2正则  [b, dim]
-            u_emd2 = F.normalize(context_user_embed[user_list], dim=1)  # L2正则  [b, dim]
-            all_user2 = F.normalize(context_user_embed, dim=1)
+            u_emd1 = F.normalize(center_user_embed[user_list])  # L2正则  [b, dim]
+            u_emd2 = F.normalize(context_user_embed[user_list])  # L2正则  [b, dim]
             v1 = torch.sum(u_emd1 * u_emd2, dim=1)
-            v2 = u_emd1.matmul(all_user2.T)
             v1 = torch.exp(v1 / self.ssl_tau)
+            all_user2 = F.normalize(context_user_embed)
+            v2 = u_emd1.matmul(all_user2.T)
             v2 = torch.sum(torch.exp(v2 / self.ssl_tau), dim=1)
-            ssl_losses.append(-torch.sum(torch.log(v1 / v2)))
+            user_loss = -torch.sum(torch.log(v1 / v2))
 
-            i_emd1 = F.normalize(center_item_embed[pos_item_list], dim=1)
-            i_emd2 = F.normalize(context_item_embed[pos_item_list], dim=1)
-            all_item2 = F.normalize(context_item_embed, dim=1)
+            i_emd1 = F.normalize(center_item_embed[pos_item_list])
+            i_emd2 = F.normalize(context_item_embed[pos_item_list])
+
             v3 = torch.sum(i_emd1 * i_emd2, dim=1)
+            all_item2 = F.normalize(context_item_embed)
             v4 = i_emd1.matmul(all_item2.T)
             v3 = torch.exp(v3 / self.ssl_tau)
             v4 = torch.sum(torch.exp(v4 / self.ssl_tau), dim=1)
-            ssl_losses.append(-torch.sum(torch.log(v3 / v4)))
+            item_loss = -torch.sum(torch.log(v3 / v4))
+
+            ssl_loss = self.ssl_weight * (user_loss + self.alpha * item_loss)
+            ssl_losses.append(ssl_loss)
 
         ssl_losses = torch.sum(torch.stack(ssl_losses))
 
-        return ssl_losses * self.ssl_weight
+        return ssl_losses
 
     def calculate_loss(self, interaction):
         if self.restore_user_e is not None or self.restore_item_e is not None:  # 计算损失前先清空保存的user和item嵌入向量
@@ -179,6 +188,7 @@ class SGLL(GeneralGraphRecommender):
 
         bpr_loss = self.calc_bpr_loss(user_emd, item_emd, user_list, pos_item_list, neg_item_list)
         ssl_loss = self.calc_ssl_loss(user_list, pos_item_list, embed_list)
+
         total_loss = bpr_loss + ssl_loss
 
         return total_loss

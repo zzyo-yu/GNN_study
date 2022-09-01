@@ -17,11 +17,11 @@ from recbole_gnn.model.abstract_recommender import GeneralGraphRecommender
 from recbole_gnn.model.layers import LightGCNConv
 
 
-class NCL(GeneralGraphRecommender):
+class NCLL(GeneralGraphRecommender):
     input_type = InputType.PAIRWISE
 
     def __init__(self, config, dataset):
-        super(NCL, self).__init__(config, dataset)
+        super(NCLL, self).__init__(config, dataset)
 
         # 加载配置参数 load parameters info
         self.latent_dim = config['embedding_size']  # int type: 嵌入维度 the embedding size of the base model
@@ -52,36 +52,6 @@ class NCL(GeneralGraphRecommender):
         self.apply(xavier_uniform_initialization)
         self.other_parameter_name = ['restore_user_e', 'restore_item_e']
 
-        # 聚类用到的工具对象
-        self.user_centroids = None   # 用户嵌入的中心点 (k, dim)
-        self.user_2cluster = None    # uid2中心点的列表 （索引是uid）
-        self.item_centroids = None   # 项目嵌入的中心店 (k, dim)
-        self.item_2cluster = None    # iid2中心点的列表 （索引是iid）
-
-    def e_step(self):
-        user_embeddings = self.user_embedding.weight.detach().cpu().numpy()  # user嵌入词典矩阵
-        item_embeddings = self.item_embedding.weight.detach().cpu().numpy()  # item嵌入词典矩阵
-        self.user_centroids, self.user_2cluster = self.run_kmeans(user_embeddings)  # user 中心词, uid2中心词的对应列表
-        self.item_centroids, self.item_2cluster = self.run_kmeans(item_embeddings)  # item 中心词, iid2中心词的对应列表
-
-    def run_kmeans(self, x):
-        """Run K-means algorithm to get k clusters of the input tensor x
-        运行k -means算法得到输入张量x的k个簇
-        """
-        import faiss
-        kmeans = faiss.Kmeans(d=self.latent_dim, k=self.k, gpu=True)   # K-means模型
-        kmeans.train(x)     # 训练
-        cluster_cents = kmeans.centroids       # 获取聚类后的中心点 (k, dim)
-
-        _, I = kmeans.index.search(x, 1)  # 获取离每个uid最近的中心点
-
-        # convert to cuda Tensors for broadcast 转换为cuda张量广播
-        centroids = torch.Tensor(cluster_cents).to(self.device)
-        centroids = F.normalize(centroids, p=2, dim=1)  # 标准化
-
-        node2cluster = torch.LongTensor(I).squeeze().to(self.device)   # squeeze
-        return centroids, node2cluster
-
     def get_ego_embeddings(self):
         r"""Get the embedding of users and items and combine to an embedding matrix.
         Returns:
@@ -98,7 +68,18 @@ class NCL(GeneralGraphRecommender):
         embeddings_list = [all_embeddings]   # 加入嵌入列表作为第0层嵌入
         # 进行多层gcn的计算
         for layer_idx in range(max(self.n_layers, self.hyper_layers * 2)):
-            all_embeddings = self.gcn_conv(all_embeddings, self.edge_index, self.edge_weight)
+            # all_embeddings = self.gcn_conv(all_embeddings, self.edge_index, self.edge_weight)
+            # embeddings_list.append(all_embeddings)
+            # 进行多层gcn的计算
+            if layer_idx > 1:
+                temp_embeddings = torch.cat(
+                    [all_embeddings.unsqueeze(dim=1), embeddings_list[0].unsqueeze(dim=1)],
+                    dim=1
+                )
+                temp_embeddings = torch.mean(temp_embeddings, dim=1)
+                all_embeddings = self.gcn_conv(temp_embeddings, self.edge_index, self.edge_weight)
+            else:
+                all_embeddings = self.gcn_conv(all_embeddings, self.edge_index, self.edge_weight)
             embeddings_list.append(all_embeddings)
 
         # 算出最终的嵌入
@@ -107,43 +88,6 @@ class NCL(GeneralGraphRecommender):
 
         user_all_embeddings, item_all_embeddings = torch.split(lightgcn_all_embeddings, [self.n_users, self.n_items])
         return user_all_embeddings, item_all_embeddings, embeddings_list
-
-    def ProtoNCE_loss(self, node_embedding, user, item):
-        """
-            :params:node_embedding  0层的嵌入
-            :params:user user列表
-            :params:item item列表
-        """
-        user_embeddings_all, item_embeddings_all = torch.split(node_embedding, [self.n_users, self.n_items])   # 分离用户嵌入和项目嵌入
-
-        user_embeddings = user_embeddings_all[user]     # [b, dim]  # 输入用户的嵌入
-        norm_user_embeddings = F.normalize(user_embeddings)    # 标准化
-
-        user2cluster = self.user_2cluster[user]     # [b,]  根据 输入uid 查找中心词
-        user2centroids = self.user_centroids[user2cluster]   # [b, e]  # 获取 输入uid 的中心词嵌入 (已做标准化)
-        # 计算user和其中心词的相似度 exp(e_u \cdot c_i | temp)
-        pos_score_user = torch.mul(norm_user_embeddings, user2centroids).sum(dim=1)   # (b, )
-        pos_score_user = torch.exp(pos_score_user / self.ssl_temp)  # (b, )
-        # 计算user和所有中心词（这里包括了该user自己的中心词）的相似度 exp(e_u \cdot c_j | temp)
-        ttl_score_user = torch.matmul(norm_user_embeddings, self.user_centroids.transpose(0, 1))   # (b, k)
-        ttl_score_user = torch.exp(ttl_score_user / self.ssl_temp).sum(dim=1)   # (b, )
-
-        proto_nce_loss_user = -torch.log(pos_score_user / ttl_score_user).sum()
-
-        # 同理，计算item的语义对比损失
-        item_embeddings = item_embeddings_all[item]
-        norm_item_embeddings = F.normalize(item_embeddings)
-
-        item2cluster = self.item_2cluster[item]  # [B, ]
-        item2centroids = self.item_centroids[item2cluster]  # [B, e]
-        pos_score_item = torch.mul(norm_item_embeddings, item2centroids).sum(dim=1)
-        pos_score_item = torch.exp(pos_score_item / self.ssl_temp)
-        ttl_score_item = torch.matmul(norm_item_embeddings, self.item_centroids.transpose(0, 1))
-        ttl_score_item = torch.exp(ttl_score_item / self.ssl_temp).sum(dim=1)
-        proto_nce_loss_item = -torch.log(pos_score_item / ttl_score_item).sum()
-
-        proto_nce_loss = self.proto_reg * (proto_nce_loss_user + proto_nce_loss_item)
-        return proto_nce_loss
 
     # 自监督学习层损失
     def ssl_layer_loss(self, current_embedding, previous_embedding, user, item):
@@ -206,7 +150,6 @@ class NCL(GeneralGraphRecommender):
 
         # 计算结构化损失
         ssl_loss = self.ssl_layer_loss(context_embedding, center_embedding, user, pos_item)
-        proto_loss = self.ProtoNCE_loss(center_embedding, user, pos_item)
 
         u_embeddings = user_all_embeddings[user]
         pos_embeddings = item_all_embeddings[pos_item]
@@ -225,7 +168,7 @@ class NCL(GeneralGraphRecommender):
 
         reg_loss = self.reg_loss(u_ego_embeddings, pos_ego_embeddings, neg_ego_embeddings)
 
-        return mf_loss + self.reg_weight * reg_loss, ssl_loss, proto_loss
+        return mf_loss + self.reg_weight * reg_loss, ssl_loss
 
     def predict(self, interaction):
         user = interaction[self.USER_ID]
